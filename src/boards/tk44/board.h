@@ -15,6 +15,12 @@
  *------------------------------------------------------------------*/
 // This board has only a Reset button
 
+// The board has no decoupling capacitors, so pressing Reset browns the chip out instead of a
+// clean pin reset: RAM and RESETREAS are lost and the RAM-based double reset never fires.
+// Keep the double reset flag in flash instead (see main.c). This is the last page of the
+// app data area below the bootloader, which UF2 never writes and RMK doesn't use.
+#define DFU_DBL_RESET_FLASH_ADDR 0xF3000
+
 //--------------------------------------------------------------------+
 // BLE OTA
 //--------------------------------------------------------------------+

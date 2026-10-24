@@ -131,6 +131,62 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 //--------------------------------------------------------------------+
 uint32_t* dbl_reset_mem = ((uint32_t*) DFU_DBL_RESET_MEM);
 
+#ifdef DFU_DBL_RESET_FLASH_ADDR
+/* Double reset detection with the flag in flash instead of RAM, enabled by board.h.
+ * For boards whose reset button browns the chip out: that kind of reset wipes RAM and
+ * leaves RESETREAS empty, so the RAM magic never survives it.
+ *
+ * The flash page is a log of words. Each detection window arms the next erased word and
+ * disarms it (writes 0) when the window ends, so a word still armed at boot means a reset
+ * cut the previous window short. Every word is written at most twice between erases
+ * (armed, then 0), and the page is erased once every 1024 windows.
+ */
+#include "nrfx_nvmc.h"
+
+#define DFU_DBL_RESET_FLASH_ARMED  0x5A1AD5A5UL
+#define DFU_DBL_RESET_FLASH_WORDS  (CODE_PAGE_SIZE / 4)
+
+// The page must be in the app data area: UF2 writes neither apps nor the staged new bootloader there
+STATIC_ASSERT((DFU_DBL_RESET_FLASH_ADDR % CODE_PAGE_SIZE) == 0);
+STATIC_ASSERT(DFU_DBL_RESET_FLASH_ADDR >= BOOTLOADER_REGION_START - DFU_APP_DATA_RESERVED);
+STATIC_ASSERT(DFU_DBL_RESET_FLASH_ADDR < BOOTLOADER_REGION_START);
+
+static uint32_t const volatile* const dbl_reset_log = (uint32_t const volatile*) DFU_DBL_RESET_FLASH_ADDR;
+static uint32_t dbl_reset_log_armed = DFU_DBL_RESET_FLASH_WORDS; // index of the word this boot armed, none
+
+// Disarm any word left armed by the previous boot. Returns true if there was one.
+static bool dbl_reset_flash_take(void) {
+  bool found = false;
+  for (uint32_t i = 0; i < DFU_DBL_RESET_FLASH_WORDS; i++) {
+    if (dbl_reset_log[i] == DFU_DBL_RESET_FLASH_ARMED) {
+      nrfx_nvmc_word_write(DFU_DBL_RESET_FLASH_ADDR + 4 * i, 0);
+      found = true;
+    }
+  }
+  return found;
+}
+
+static void dbl_reset_flash_arm(void) {
+  uint32_t i = 0;
+  while (i < DFU_DBL_RESET_FLASH_WORDS && dbl_reset_log[i] != 0xFFFFFFFFUL) {
+    i++;
+  }
+  if (i == DFU_DBL_RESET_FLASH_WORDS) {
+    nrfx_nvmc_page_erase(DFU_DBL_RESET_FLASH_ADDR);
+    i = 0;
+  }
+  nrfx_nvmc_word_write(DFU_DBL_RESET_FLASH_ADDR + 4 * i, DFU_DBL_RESET_FLASH_ARMED);
+  dbl_reset_log_armed = i;
+}
+
+static void dbl_reset_flash_disarm(void) {
+  if (dbl_reset_log_armed < DFU_DBL_RESET_FLASH_WORDS) {
+    nrfx_nvmc_word_write(DFU_DBL_RESET_FLASH_ADDR + 4 * dbl_reset_log_armed, 0);
+    dbl_reset_log_armed = DFU_DBL_RESET_FLASH_WORDS;
+  }
+}
+#endif
+
 // true if ble, false if serial
 bool _ota_dfu = false;
 bool _ota_connected = false;
@@ -252,11 +308,21 @@ static void check_dfu_mode(void) {
   bool const uf2_dfu         = (gpregret == DFU_MAGIC_UF2_RESET);
   bool const dfu_skip        = (gpregret == DFU_MAGIC_SKIP);
 
+#ifdef DFU_DBL_RESET_FLASH_ADDR
+  // A reset button that browns the chip out leaves RESETREAS empty, same as power-on: count both.
+  // Soft and watchdog resets still don't open the double reset window.
+  uint32_t const resetreas = NRF_POWER->RESETREAS;
+  bool const reason_reset_pin = (resetreas & POWER_RESETREAS_RESETPIN_Msk) || (resetreas == 0);
+
+  // Always clear a flag left by the previous boot. NVMC must not be touched while the SoftDevice runs.
+  bool const dbl_reset = !_sd_inited && dbl_reset_flash_take() && reason_reset_pin;
+#else
   bool const reason_reset_pin = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) ? true : false;
+  bool const dbl_reset = ((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin;
+#endif
 
   // start either serial, uf2 or ble
-  bool dfu_start = _ota_dfu || serial_only_dfu || uf2_dfu ||
-                   (((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin);
+  bool dfu_start = _ota_dfu || serial_only_dfu || uf2_dfu || dbl_reset;
 
   // Clear GPREGRET if it is our values
   if (dfu_start || dfu_skip) {
@@ -307,10 +373,18 @@ static void check_dfu_mode(void) {
     // Note: RESETREAS is not clear by bootloader, it should be cleared by application upon init()
     if (reason_reset_pin) {
       // Register our first reset for double reset detection
+#ifdef DFU_DBL_RESET_FLASH_ADDR
+      dbl_reset_flash_arm();
+#else
       (*dbl_reset_mem) = DFU_DBL_RESET_MAGIC;
+#endif
 
       // if RST is pressed during this delay (double reset)--> if will enter dfu
       NRFX_DELAY_MS(DFU_DBL_RESET_DELAY);
+
+#ifdef DFU_DBL_RESET_FLASH_ADDR
+      dbl_reset_flash_disarm();
+#endif
     }
 #endif
   }
@@ -333,8 +407,16 @@ static void check_dfu_mode(void) {
       usb_init(serial_only_dfu);
     }
 
+#ifdef DFU_DBL_RESET_FLASH_ADDR
+    // Unlike RAM, the flash flag survives a power-off, e.g. power cut during the window.
+    // Such a double reset gets the timeout too, so the board can't get stuck in DFU on battery.
+    bool const dfu_timeout = dbl_reset;
+#else
+    bool const dfu_timeout = false;
+#endif
+
     // Initiate an update of the firmware.
-    if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu) {
+    if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu || dfu_timeout) {
       // If USB is not enumerated in 3s (eg. because we're running on battery), we restart into app.
       bootloader_dfu_start(_ota_dfu, 3000, true);
     } else {
